@@ -99,17 +99,9 @@ echo "sdk.dir=/path/to/android/sdk" > local.properties
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-## Performance (approximate)
+## Performance
 
-Measured on a Samsung Galaxy device (Snapdragon 8 Gen 2), 8 codebooks, ~10s audio:
-
-| Model | Encode | Decode |
-|-------|--------|--------|
-| FP32 | 0.2-0.3x realtime | 0.2x realtime |
-| Q8 | 0.5x realtime | 0.4x realtime |
-| Q4 | ~0.6x realtime | ~0.5x realtime |
-
-> Realtime = 1.0x means processing takes exactly as long as the audio duration.
+Performance varies by device. The app displays realtime factors for encode and decode after each run. Quantized models (Q4, Q8) are significantly faster than FP32 due to reduced memory bandwidth and optimized integer matmuls.
 
 ## License
 
