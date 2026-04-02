@@ -1,0 +1,19 @@
+*.iml
+.gradle
+/local.properties
+/.idea
+/build
+/captures
+.externalNativeBuild
+.cxx
+/app/build
+*.apk
+*.ap_
+*.aab
+*.DS_Store
+
+# Native libs are built from mimi-codec — see README for build instructions
+/app/src/main/jniLibs/
+
+# Demo package with APK + models (too large for git)
+/demo-package/
