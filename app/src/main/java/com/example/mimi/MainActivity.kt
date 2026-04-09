@@ -26,6 +26,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -36,7 +37,18 @@ import java.net.URL
 enum class ModelVariant(val label: String, val filename: String) {
     FP32("FP32", "mimi_model.safetensors"),
     Q8("Q8", "mimi_q8.gguf"),
-    Q4("Q4", "mimi_q4_0.gguf");
+    Q4("Q4", "mimi_q4_0.gguf"),
+    ONNX_8CB("ONNX-8cb", "onnx_8cb"),
+    ONNX_16CB("ONNX-16cb", "onnx_16cb");
+
+    val isOnnx: Boolean get() = this == ONNX_8CB || this == ONNX_16CB
+
+    /** ONNX models have a fixed codebook count baked into the model. */
+    val fixedCodebooks: Int? get() = when (this) {
+        ONNX_8CB -> 8
+        ONNX_16CB -> 16
+        else -> null
+    }
 }
 
 class MainActivity : ComponentActivity() {
@@ -52,7 +64,7 @@ class MainActivity : ComponentActivity() {
     // UI state
     private var modelStatus = mutableStateOf("Checking models...")
     private var modelReady = mutableStateOf(false)
-    private var selectedModel = mutableStateOf(ModelVariant.Q4)
+    private var selectedModel = mutableStateOf(ModelVariant.ONNX_8CB)
     private var availableModels = mutableStateOf(emptySet<ModelVariant>())
     private var selectedCodebooks = mutableIntStateOf(8)
     private var selectedChunkMs = mutableIntStateOf(320)
@@ -62,6 +74,13 @@ class MainActivity : ComponentActivity() {
     private var pipelineStatus = mutableStateOf("")
     private var encodeStats = mutableStateOf("")
     private var decodeStats = mutableStateOf("")
+
+    // Pre-created codecs (avoids loading models on each PTT press)
+    private var encoderCodec: MimiCodec? = null
+    private var decoderCodec: MimiCodec? = null
+    private var cachedVariant: ModelVariant? = null
+    private var cachedNumCb: Int = 0
+    private var codecsReady = mutableStateOf(false)
 
     // Pipeline control
     @Volatile
@@ -92,6 +111,48 @@ class MainActivity : ComponentActivity() {
         detectAndPrepareModels()
     }
 
+    override fun onDestroy() {
+        super.onDestroy()
+        encoderCodec?.destroy()
+        decoderCodec?.destroy()
+        encoderCodec = null
+        decoderCodec = null
+    }
+
+    private var prepareJob: Job? = null
+
+    /** Pre-load codec instances so PTT starts instantly. */
+    private fun prepareCodecs(variant: ModelVariant, numCb: Int) {
+        if (variant == cachedVariant && numCb == cachedNumCb && codecsReady.value) return
+        // Update cached values synchronously to prevent races on fast switching
+        cachedVariant = variant
+        cachedNumCb = numCb
+        codecsReady.value = false
+        modelStatus.value = "Loading ${variant.label} model..."
+        // Cancel any in-flight preparation
+        prepareJob?.cancel()
+        prepareJob = lifecycleScope.launch(Dispatchers.IO) {
+            encoderCodec?.destroy()
+            decoderCodec?.destroy()
+            encoderCodec = null
+            decoderCodec = null
+            try {
+                val enc = createCodec(variant, numCb)
+                val dec = createCodec(variant, numCb)
+                encoderCodec = enc
+                decoderCodec = dec
+                withContext(Dispatchers.Main) {
+                    codecsReady.value = true
+                    modelStatus.value = "Ready: ${variant.label}"
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    modelStatus.value = "Failed to load ${variant.label}: ${e.message}"
+                }
+            }
+        }
+    }
+
     @Composable
     private fun MimiDemoScreen() {
         val scrollState = rememberScrollState()
@@ -107,6 +168,7 @@ class MainActivity : ComponentActivity() {
         val pStatus by pipelineStatus
         val encStats by encodeStats
         val decStats by decodeStats
+        val codecReady by codecsReady
 
         Column(
             modifier = Modifier
@@ -133,7 +195,11 @@ class MainActivity : ComponentActivity() {
                     val isAvailable = variant in available
                     FilterChip(
                         selected = model == variant,
-                        onClick = { selectedModel.value = variant },
+                        onClick = {
+                            selectedModel.value = variant
+                            val numCb = variant.fixedCodebooks ?: codebooks
+                            prepareCodecs(variant, numCb)
+                        },
                         label = { Text(variant.label) },
                         enabled = isAvailable && !pttActive
                     )
@@ -143,15 +209,26 @@ class MainActivity : ComponentActivity() {
             HorizontalDivider()
 
             // Codebook selector
-            Text("Codebooks:", fontWeight = FontWeight.Medium)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                codebookOptions.forEach { n ->
-                    FilterChip(
-                        selected = codebooks == n,
-                        onClick = { selectedCodebooks.intValue = n },
-                        label = { Text("$n") },
-                        enabled = !pttActive
-                    )
+            val isOnnxModel = model.isOnnx
+            val effectiveCodebooks = model.fixedCodebooks ?: codebooks
+            Text(
+                if (isOnnxModel) "Codebooks: $effectiveCodebooks (fixed by ONNX model)"
+                else "Codebooks:",
+                fontWeight = FontWeight.Medium
+            )
+            if (!isOnnxModel) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    codebookOptions.forEach { n ->
+                        FilterChip(
+                            selected = codebooks == n,
+                            onClick = {
+                                selectedCodebooks.intValue = n
+                                prepareCodecs(model, n)
+                            },
+                            label = { Text("$n") },
+                            enabled = !pttActive
+                        )
+                    }
                 }
             }
 
@@ -195,15 +272,15 @@ class MainActivity : ComponentActivity() {
             // Push-to-talk button
             Button(
                 onClick = { /* handled by pointerInput */ },
-                enabled = ready && !playing,
+                enabled = ready && codecReady && !playing,
                 colors = if (recActive) ButtonDefaults.buttonColors(
                     containerColor = MaterialTheme.colorScheme.error
                 ) else ButtonDefaults.buttonColors(),
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(64.dp)
-                    .pointerInput(ready, playing) {
-                        if (!ready || playing) return@pointerInput
+                    .pointerInput(ready, codecReady, playing) {
+                        if (!ready || !codecReady || playing) return@pointerInput
                         awaitEachGesture {
                             awaitFirstDown(requireUnconsumed = false)
                             onPttPressed()
@@ -276,19 +353,29 @@ class MainActivity : ComponentActivity() {
         decodeStats.value = ""
         pipelineStatus.value = "Initializing..."
 
-        val numCb = selectedCodebooks.intValue
+        val variant = selectedModel.value
+        val numCb = variant.fixedCodebooks ?: selectedCodebooks.intValue
         val chunkMs = selectedChunkMs.intValue
         val chunkSize = SAMPLE_RATE * chunkMs / 1000
-        val modelPath = resolveModelPath()
-        val modelLabel = selectedModel.value.label
+        val modelLabel = variant.label
+
+        // Grab pre-created codecs
+        val encoder = encoderCodec ?: return
+        val decoder = decoderCodec ?: return
+        encoder.reset()
+        encoder.resetTimings()
+        decoder.reset()
+        decoder.resetTimings()
 
         // Channels for pipeline stages
         val pcmChannel = Channel<FloatArray>(Channel.UNLIMITED)
         val tokenChannel = Channel<IntArray>(Channel.UNLIMITED)
 
-        // Track per-step timings
+        // Track per-step timings and data sizes
         val encodeStepMs = mutableListOf<Double>()
         val decodeStepMs = mutableListOf<Double>()
+        var totalPcmSamples = 0
+        var totalEncodedCodes = 0
 
         // 1. Recording thread — fills chunks and sends to pcmChannel
         val recordJob = lifecycleScope.launch(Dispatchers.IO) {
@@ -353,17 +440,15 @@ class MainActivity : ComponentActivity() {
         // 2. Encode coroutine — reads PCM chunks, encodes, sends tokens
         val encodeJob = lifecycleScope.launch(Dispatchers.Default) {
             try {
-                val encoder = MimiCodec.create(modelPath, numCb)
-                encoder.reset()
-                encoder.resetTimings()
-
                 for (pcmChunk in pcmChannel) {
+                    totalPcmSamples += pcmChunk.size
                     val t0 = System.nanoTime()
                     val tokens = encoder.encodeStep(pcmChunk)
                     val stepMs = (System.nanoTime() - t0) / 1_000_000.0
 
                     if (tokens != null) {
                         encodeStepMs.add(stepMs)
+                        totalEncodedCodes += tokens.size
                         tokenChannel.send(tokens)
 
                         withContext(Dispatchers.Main) {
@@ -373,11 +458,11 @@ class MainActivity : ComponentActivity() {
                 }
 
                 val timings = encoder.getTimings()
-                encoder.destroy()
 
                 withContext(Dispatchers.Main) {
                     encodeStats.value = formatFinalEncodeStats(
-                        modelLabel, numCb, chunkMs, encodeStepMs, timings
+                        modelLabel, numCb, chunkMs, encodeStepMs, timings,
+                        totalPcmSamples, totalEncodedCodes
                     )
                 }
             } finally {
@@ -388,10 +473,6 @@ class MainActivity : ComponentActivity() {
         // 3. Decode coroutine — decode immediately as tokens arrive
         val decodedPcmChunks = mutableListOf<FloatArray>()
         val decodeJob = lifecycleScope.launch(Dispatchers.Default) {
-            val decoder = MimiCodec.create(modelPath, numCb)
-            decoder.reset()
-            decoder.resetTimings()
-
             for (tokens in tokenChannel) {
                 val t0 = System.nanoTime()
                 val pcm = decoder.decodeStep(tokens)
@@ -405,7 +486,6 @@ class MainActivity : ComponentActivity() {
             }
 
             val timings = decoder.getTimings()
-            decoder.destroy()
 
             withContext(Dispatchers.Main) {
                 decodeStats.value = formatFinalDecodeStats(
@@ -505,7 +585,8 @@ class MainActivity : ComponentActivity() {
 
     private fun formatFinalEncodeStats(
         modelLabel: String, numCb: Int, chunkMs: Int,
-        steps: List<Double>, timings: MimiCodec.Timings?
+        steps: List<Double>, timings: MimiCodec.Timings?,
+        totalPcmSamples: Int, totalEncodedCodes: Int
     ): String {
         if (steps.isEmpty()) return "No encode steps"
         val avg = steps.average()
@@ -513,12 +594,27 @@ class MainActivity : ComponentActivity() {
         val max = steps.max()
         val total = steps.sum()
         val rtFactor = if (avg > 0) chunkMs / avg else 0.0
+        val audioDurationSecs = totalPcmSamples.toDouble() / SAMPLE_RATE
+        // Each code = 11 bits (2048 codebook entries = 2^11)
+        val bitsPerCode = 11
+        val encodedBits = totalEncodedCodes.toLong() * bitsPerCode
+        val encodedBytes = (encodedBits + 7) / 8
+        val rawPcmBytes = totalPcmSamples.toLong() * 2  // 16-bit PCM
+        val bitrate = if (audioDurationSecs > 0) encodedBits / audioDurationSecs else 0.0
+        val compressionRatio = if (encodedBytes > 0) rawPcmBytes.toDouble() / encodedBytes else 0.0
         return buildString {
             appendLine("Model:     $modelLabel | CB: $numCb | Chunk: ${chunkMs}ms")
             appendLine("Steps:     ${steps.size}")
             appendLine("Per step:  avg %.0f ms | min %.0f | max %.0f".format(avg, min, max))
             appendLine("Total:     %.0f ms".format(total))
             appendLine("Realtime:  %.1fx".format(rtFactor))
+            appendLine("─── Compression ───")
+            appendLine("Audio:     %.1f s (%s PCM @ 16-bit)".format(
+                audioDurationSecs, formatBytes(rawPcmBytes)))
+            appendLine("Encoded:   %d codes × %d bits = %s".format(
+                totalEncodedCodes, bitsPerCode, formatBytes(encodedBytes)))
+            appendLine("Bitrate:   %.1f kbps".format(bitrate / 1000.0))
+            appendLine("Compress:  %.0fx".format(compressionRatio))
             if (timings != null) {
                 appendLine("─── Component totals ───")
                 appendLine("  SEANet:       %.0f ms".format(timings.seanetEncode * 1000))
@@ -526,6 +622,14 @@ class MainActivity : ComponentActivity() {
                 appendLine("  Downsample:   %.0f ms".format(timings.downsample * 1000))
                 append("  Quantizer:    %.0f ms".format(timings.quantizerEncode * 1000))
             }
+        }
+    }
+
+    private fun formatBytes(bytes: Long): String {
+        return when {
+            bytes < 1024 -> "$bytes B"
+            bytes < 1024 * 1024 -> "%.1f KB".format(bytes / 1024.0)
+            else -> "%.1f MB".format(bytes / (1024.0 * 1024.0))
         }
     }
 
@@ -562,20 +666,45 @@ class MainActivity : ComponentActivity() {
             val found = mutableSetOf<ModelVariant>()
 
             for (variant in ModelVariant.entries) {
-                val localFile = File(filesDir, variant.filename)
-                if (localFile.exists()) {
-                    found.add(variant)
-                    continue
-                }
-                val adbFile = File("/data/local/tmp/${variant.filename}")
-                if (adbFile.exists()) {
-                    withContext(Dispatchers.Main) {
-                        modelStatus.value = "Copying ${variant.label} from adb..."
-                    }
-                    try {
-                        adbFile.copyTo(localFile, overwrite = true)
+                if (variant.isOnnx) {
+                    // ONNX models are directories with encoder_model.onnx + decoder_model.onnx
+                    val localDir = File(filesDir, variant.filename)
+                    val enc = File(localDir, "encoder_model.onnx")
+                    val dec = File(localDir, "decoder_model.onnx")
+                    if (enc.exists() && dec.exists()) {
                         found.add(variant)
-                    } catch (_: Exception) { }
+                        continue
+                    }
+                    val adbDir = File("/data/local/tmp/${variant.filename}")
+                    val adbEnc = File(adbDir, "encoder_model.onnx")
+                    val adbDec = File(adbDir, "decoder_model.onnx")
+                    if (adbEnc.exists() && adbDec.exists()) {
+                        withContext(Dispatchers.Main) {
+                            modelStatus.value = "Copying ${variant.label} from adb..."
+                        }
+                        try {
+                            localDir.mkdirs()
+                            adbEnc.copyTo(enc, overwrite = true)
+                            adbDec.copyTo(dec, overwrite = true)
+                            found.add(variant)
+                        } catch (_: Exception) { }
+                    }
+                } else {
+                    val localFile = File(filesDir, variant.filename)
+                    if (localFile.exists()) {
+                        found.add(variant)
+                        continue
+                    }
+                    val adbFile = File("/data/local/tmp/${variant.filename}")
+                    if (adbFile.exists()) {
+                        withContext(Dispatchers.Main) {
+                            modelStatus.value = "Copying ${variant.label} from adb..."
+                        }
+                        try {
+                            adbFile.copyTo(localFile, overwrite = true)
+                            found.add(variant)
+                        } catch (_: Exception) { }
+                    }
                 }
             }
 
@@ -583,13 +712,16 @@ class MainActivity : ComponentActivity() {
                 availableModels.value = found
                 if (found.isNotEmpty()) {
                     val best = when {
+                        ModelVariant.ONNX_8CB in found -> ModelVariant.ONNX_8CB
                         ModelVariant.Q4 in found -> ModelVariant.Q4
                         ModelVariant.Q8 in found -> ModelVariant.Q8
-                        else -> ModelVariant.FP32
+                        else -> found.first()
                     }
                     selectedModel.value = best
-                    modelStatus.value = "Ready: ${found.joinToString(", ") { it.label }}"
+                    modelStatus.value = "Found: ${found.joinToString(", ") { it.label }}"
                     modelReady.value = true
+                    val numCb = best.fixedCodebooks ?: selectedCodebooks.intValue
+                    prepareCodecs(best, numCb)
                 } else {
                     modelStatus.value = "No models found. Downloading FP32..."
                     downloadFp32Model()
@@ -649,5 +781,20 @@ class MainActivity : ComponentActivity() {
 
     private fun resolveModelPath(): String {
         return File(filesDir, selectedModel.value.filename).absolutePath
+    }
+
+    private fun createCodec(variant: ModelVariant, numCodebooks: Int): MimiCodec {
+        return if (variant.isOnnx) {
+            val dir = File(filesDir, variant.filename)
+            MimiCodec.createOnnx(
+                encoderPath = File(dir, "encoder_model.onnx").absolutePath,
+                decoderPath = File(dir, "decoder_model.onnx").absolutePath,
+                numCodebooks = variant.fixedCodebooks ?: numCodebooks,
+                useNnapi = true,
+                streaming = true,
+            )
+        } else {
+            MimiCodec.create(resolveModelPath(), numCodebooks)
+        }
     }
 }

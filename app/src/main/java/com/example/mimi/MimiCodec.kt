@@ -13,8 +13,29 @@ class MimiCodec private constructor(private var handle: Long) {
             return MimiCodec(handle)
         }
 
+        fun createOnnx(
+            encoderPath: String,
+            decoderPath: String,
+            numCodebooks: Int,
+            useNnapi: Boolean,
+            streaming: Boolean = true,
+        ): MimiCodec {
+            val handle = nativeCreateOnnx(encoderPath, decoderPath, numCodebooks, useNnapi, streaming)
+            if (handle == 0L) throw RuntimeException("Failed to create ONNX codec")
+            return MimiCodec(handle)
+        }
+
         @JvmStatic
         private external fun nativeCreate(modelPath: String, numCodebooks: Int): Long
+
+        @JvmStatic
+        private external fun nativeCreateOnnx(
+            encoderPath: String,
+            decoderPath: String,
+            numCodebooks: Int,
+            useNnapi: Boolean,
+            streaming: Boolean,
+        ): Long
 
         @JvmStatic
         private external fun nativeEncode(handle: Long, pcm: FloatArray): IntArray
