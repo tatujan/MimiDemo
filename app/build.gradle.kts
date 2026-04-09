@@ -23,6 +23,10 @@ android {
         kotlinCompilerExtensionVersion = "1.5.8"
     }
 
+    androidResources {
+        noCompress += listOf("onnx", "txt")
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_1_8
         targetCompatibility = JavaVersion.VERSION_1_8

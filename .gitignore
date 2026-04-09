@@ -17,3 +17,5 @@
 
 # Demo package with APK + models (too large for git)
 /demo-package/
+app/src/main/assets/onnx_8cb/
+app/src/main/assets/onnx_16cb/

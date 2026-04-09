@@ -1,6 +1,7 @@
 package com.example.mimi
 
 import android.Manifest
+import android.util.Log
 import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
@@ -31,23 +32,17 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
 
 enum class ModelVariant(val label: String, val filename: String) {
-    FP32("FP32", "mimi_model.safetensors"),
-    Q8("Q8", "mimi_q8.gguf"),
-    Q4("Q4", "mimi_q4_0.gguf"),
     ONNX_8CB("ONNX-8cb", "onnx_8cb"),
     ONNX_16CB("ONNX-16cb", "onnx_16cb");
 
-    val isOnnx: Boolean get() = this == ONNX_8CB || this == ONNX_16CB
+    val isOnnx: Boolean get() = true
 
     /** ONNX models have a fixed codebook count baked into the model. */
     val fixedCodebooks: Int? get() = when (this) {
         ONNX_8CB -> 8
         ONNX_16CB -> 16
-        else -> null
     }
 }
 
@@ -57,8 +52,6 @@ class MainActivity : ComponentActivity() {
         private const val SAMPLE_RATE = 24000
         private const val MAX_RECORD_SECONDS = 60
         private const val MIN_PLAYBACK_SECONDS = 1.0f
-        private const val MODEL_URL =
-            "https://huggingface.co/kyutai/moshiko-pytorch-bf16/resolve/main/tokenizer-e351c8d8-checkpoint125.safetensors"
     }
 
     // UI state
@@ -440,11 +433,17 @@ class MainActivity : ComponentActivity() {
         // 2. Encode coroutine — reads PCM chunks, encodes, sends tokens
         val encodeJob = lifecycleScope.launch(Dispatchers.Default) {
             try {
+                var frameIdx = 0
                 for (pcmChunk in pcmChannel) {
                     totalPcmSamples += pcmChunk.size
                     val t0 = System.nanoTime()
                     val tokens = encoder.encodeStep(pcmChunk)
                     val stepMs = (System.nanoTime() - t0) / 1_000_000.0
+
+                    if (frameIdx < 10 || frameIdx % 50 == 0) {
+                        Log.d("MimiEncode", "frame=$frameIdx pcm=${pcmChunk.size} tokens=${tokens?.size} ms=${"%.1f".format(stepMs)}")
+                    }
+                    frameIdx++
 
                     if (tokens != null) {
                         encodeStepMs.add(stepMs)
@@ -675,6 +674,12 @@ class MainActivity : ComponentActivity() {
                         found.add(variant)
                         continue
                     }
+                    // Try copying from bundled assets first
+                    if (copyOnnxFromAssets(variant.filename, localDir)) {
+                        found.add(variant)
+                        continue
+                    }
+                    // Fallback: copy from adb push location
                     val adbDir = File("/data/local/tmp/${variant.filename}")
                     val adbEnc = File(adbDir, "encoder_model.onnx")
                     val adbDec = File(adbDir, "decoder_model.onnx")
@@ -686,22 +691,10 @@ class MainActivity : ComponentActivity() {
                             localDir.mkdirs()
                             adbEnc.copyTo(enc, overwrite = true)
                             adbDec.copyTo(dec, overwrite = true)
-                            found.add(variant)
-                        } catch (_: Exception) { }
-                    }
-                } else {
-                    val localFile = File(filesDir, variant.filename)
-                    if (localFile.exists()) {
-                        found.add(variant)
-                        continue
-                    }
-                    val adbFile = File("/data/local/tmp/${variant.filename}")
-                    if (adbFile.exists()) {
-                        withContext(Dispatchers.Main) {
-                            modelStatus.value = "Copying ${variant.label} from adb..."
-                        }
-                        try {
-                            adbFile.copyTo(localFile, overwrite = true)
+                            val adbSpec = File(adbDir, "state_spec.txt")
+                            if (adbSpec.exists()) {
+                                adbSpec.copyTo(File(localDir, "state_spec.txt"), overwrite = true)
+                            }
                             found.add(variant)
                         } catch (_: Exception) { }
                     }
@@ -711,90 +704,46 @@ class MainActivity : ComponentActivity() {
             withContext(Dispatchers.Main) {
                 availableModels.value = found
                 if (found.isNotEmpty()) {
-                    val best = when {
-                        ModelVariant.ONNX_8CB in found -> ModelVariant.ONNX_8CB
-                        ModelVariant.Q4 in found -> ModelVariant.Q4
-                        ModelVariant.Q8 in found -> ModelVariant.Q8
-                        else -> found.first()
-                    }
+                    val best = found.first()
                     selectedModel.value = best
                     modelStatus.value = "Found: ${found.joinToString(", ") { it.label }}"
                     modelReady.value = true
                     val numCb = best.fixedCodebooks ?: selectedCodebooks.intValue
                     prepareCodecs(best, numCb)
                 } else {
-                    modelStatus.value = "No models found. Downloading FP32..."
-                    downloadFp32Model()
+                    modelStatus.value = "No ONNX models found. Push to /data/local/tmp/ or bundle in assets."
                 }
             }
         }
     }
 
-    private fun downloadFp32Model() {
-        lifecycleScope.launch(Dispatchers.IO) {
-            try {
-                val targetFile = File(filesDir, ModelVariant.FP32.filename)
-                val tmpFile = File(filesDir, "${ModelVariant.FP32.filename}.tmp")
-                val url = URL(MODEL_URL)
-                val conn = url.openConnection() as HttpURLConnection
-                conn.connectTimeout = 15000
-                conn.readTimeout = 30000
-                conn.connect()
 
-                val totalBytes = conn.contentLength.toLong()
-                var downloadedBytes = 0L
-
-                conn.inputStream.use { input ->
-                    tmpFile.outputStream().use { output ->
-                        val buffer = ByteArray(65536)
-                        while (true) {
-                            val read = input.read(buffer)
-                            if (read == -1) break
-                            output.write(buffer, 0, read)
-                            downloadedBytes += read
-
-                            if (totalBytes > 0) {
-                                val pct = (downloadedBytes * 100 / totalBytes).toInt()
-                                withContext(Dispatchers.Main) {
-                                    modelStatus.value = "Downloading FP32... $pct%"
-                                }
-                            }
-                        }
+    private fun copyOnnxFromAssets(assetDir: String, localDir: File): Boolean {
+        return try {
+            val files = assets.list(assetDir) ?: return false
+            if (!files.contains("encoder_model.onnx") || !files.contains("decoder_model.onnx")) return false
+            localDir.mkdirs()
+            for (name in files) {
+                assets.open("$assetDir/$name").use { input ->
+                    File(localDir, name).outputStream().use { output ->
+                        input.copyTo(output)
                     }
                 }
-
-                tmpFile.renameTo(targetFile)
-
-                withContext(Dispatchers.Main) {
-                    availableModels.value = availableModels.value + ModelVariant.FP32
-                    selectedModel.value = ModelVariant.FP32
-                    modelStatus.value = "Ready: FP32"
-                    modelReady.value = true
-                }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    modelStatus.value = "Download failed: ${e.message}"
-                }
             }
+            true
+        } catch (_: Exception) {
+            false
         }
-    }
-
-    private fun resolveModelPath(): String {
-        return File(filesDir, selectedModel.value.filename).absolutePath
     }
 
     private fun createCodec(variant: ModelVariant, numCodebooks: Int): MimiCodec {
-        return if (variant.isOnnx) {
-            val dir = File(filesDir, variant.filename)
-            MimiCodec.createOnnx(
-                encoderPath = File(dir, "encoder_model.onnx").absolutePath,
-                decoderPath = File(dir, "decoder_model.onnx").absolutePath,
-                numCodebooks = variant.fixedCodebooks ?: numCodebooks,
-                useNnapi = true,
-                streaming = true,
-            )
-        } else {
-            MimiCodec.create(resolveModelPath(), numCodebooks)
-        }
+        val dir = File(filesDir, variant.filename)
+        return MimiCodec.createOnnx(
+            encoderPath = File(dir, "encoder_model.onnx").absolutePath,
+            decoderPath = File(dir, "decoder_model.onnx").absolutePath,
+            numCodebooks = variant.fixedCodebooks ?: numCodebooks,
+            useNnapi = true,
+            streaming = true,
+        )
     }
 }
