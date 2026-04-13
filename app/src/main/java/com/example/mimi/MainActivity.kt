@@ -36,12 +36,14 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
 
-enum class ModelVariant(val label: String, val filename: String) {
-    ONNX_8CB("ONNX-8cb", "onnx_8cb"),
-    ONNX_16CB("ONNX-16cb", "onnx_16cb"),
-    ONNX_8CB_FP16("ONNX-8cb-fp16", "onnx_8cb_fp16"),
-    ONNX_16CB_FP16("ONNX-16cb-fp16", "onnx_16cb_fp16");
+enum class ModelVariant(val label: String, val filename: String, val hfSubdir: String) {
+    ONNX_8CB("ONNX-8cb", "onnx_8cb", "streaming-8cb"),
+    ONNX_16CB("ONNX-16cb", "onnx_16cb", "streaming-16cb"),
+    ONNX_8CB_FP16("ONNX-8cb-fp16", "onnx_8cb_fp16", "streaming-8cb-fp16"),
+    ONNX_16CB_FP16("ONNX-16cb-fp16", "onnx_16cb_fp16", "streaming-16cb-fp16");
 
     val isOnnx: Boolean get() = true
 
@@ -49,6 +51,12 @@ enum class ModelVariant(val label: String, val filename: String) {
     val fixedCodebooks: Int? get() = when (this) {
         ONNX_8CB, ONNX_8CB_FP16 -> 8
         ONNX_16CB, ONNX_16CB_FP16 -> 16
+    }
+
+    companion object {
+        const val HF_REPO = "BMekiker/mimi-onnx-streaming"
+        const val HF_BASE_URL = "https://huggingface.co/$HF_REPO/resolve/main"
+        val MODEL_FILES = listOf("encoder_model.onnx", "decoder_model.onnx", "state_spec.txt")
     }
 }
 
@@ -120,15 +128,13 @@ class MainActivity : ComponentActivity() {
 
     private var prepareJob: Job? = null
 
-    /** Pre-load codec instances so PTT starts instantly. */
+    /** Pre-load codec instances so PTT starts instantly. Downloads model if needed. */
     private fun prepareCodecs(variant: ModelVariant, numCb: Int) {
         if (variant == cachedVariant && numCb == cachedNumCb && codecsReady.value) return
-        // Update cached values synchronously to prevent races on fast switching
         cachedVariant = variant
         cachedNumCb = numCb
         codecsReady.value = false
-        modelStatus.value = "Loading ${variant.label} model..."
-        // Cancel any in-flight preparation
+        modelStatus.value = "Loading ${variant.label}..."
         prepareJob?.cancel()
         prepareJob = lifecycleScope.launch(Dispatchers.IO) {
             encoderCodec?.destroy()
@@ -136,6 +142,10 @@ class MainActivity : ComponentActivity() {
             encoderCodec = null
             decoderCodec = null
             try {
+                if (!ensureModelDownloaded(variant)) return@launch
+                withContext(Dispatchers.Main) {
+                    modelStatus.value = "Loading ${variant.label}..."
+                }
                 val enc = createCodec(variant, numCb)
                 val dec = createCodec(variant, numCb)
                 encoderCodec = enc
@@ -667,79 +677,157 @@ class MainActivity : ComponentActivity() {
     // --- Model Detection & Download ---
 
     private fun detectAndPrepareModels() {
-        lifecycleScope.launch(Dispatchers.IO) {
-            val found = mutableSetOf<ModelVariant>()
+        // All variants are always available — models download on demand from HuggingFace
+        val allVariants = ModelVariant.entries.toSet()
+        availableModels.value = allVariants
 
-            for (variant in ModelVariant.entries) {
-                if (variant.isOnnx) {
-                    // ONNX models are directories with encoder_model.onnx + decoder_model.onnx
-                    val localDir = File(filesDir, variant.filename)
-                    val enc = File(localDir, "encoder_model.onnx")
-                    val dec = File(localDir, "decoder_model.onnx")
-                    if (enc.exists() && dec.exists()) {
-                        found.add(variant)
-                        continue
-                    }
-                    // Try copying from bundled assets first
-                    if (copyOnnxFromAssets(variant.filename, localDir)) {
-                        found.add(variant)
-                        continue
-                    }
-                    // Fallback: copy from adb push location
-                    val adbDir = File("/data/local/tmp/${variant.filename}")
-                    val adbEnc = File(adbDir, "encoder_model.onnx")
-                    val adbDec = File(adbDir, "decoder_model.onnx")
-                    if (adbEnc.exists() && adbDec.exists()) {
-                        withContext(Dispatchers.Main) {
-                            modelStatus.value = "Copying ${variant.label} from adb..."
-                        }
-                        try {
-                            localDir.mkdirs()
-                            adbEnc.copyTo(enc, overwrite = true)
-                            adbDec.copyTo(dec, overwrite = true)
-                            val adbSpec = File(adbDir, "state_spec.txt")
-                            if (adbSpec.exists()) {
-                                adbSpec.copyTo(File(localDir, "state_spec.txt"), overwrite = true)
-                            }
-                            found.add(variant)
-                        } catch (_: Exception) { }
-                    }
-                }
-            }
+        // Check which are already downloaded
+        val local = allVariants.filter { isModelLocal(it) }
+        val defaultVariant = if (local.isNotEmpty()) local.first() else ModelVariant.ONNX_8CB_FP16
+        selectedModel.value = defaultVariant
+        modelReady.value = true
 
+        if (local.isNotEmpty()) {
+            modelStatus.value = "Cached: ${local.joinToString(", ") { it.label }}"
+        } else {
+            modelStatus.value = "Select a model — downloads from HuggingFace on first use"
+        }
+
+        val numCb = defaultVariant.fixedCodebooks ?: selectedCodebooks.intValue
+        prepareCodecs(defaultVariant, numCb)
+    }
+
+    private fun isModelLocal(variant: ModelVariant): Boolean {
+        val dir = File(filesDir, variant.filename)
+        return File(dir, "encoder_model.onnx").exists() && File(dir, "decoder_model.onnx").exists()
+    }
+
+    /** Ensure model files exist locally, downloading from HuggingFace if needed. */
+    private suspend fun ensureModelDownloaded(variant: ModelVariant): Boolean {
+        val localDir = File(filesDir, variant.filename)
+        val enc = File(localDir, "encoder_model.onnx")
+        val dec = File(localDir, "decoder_model.onnx")
+        if (enc.exists() && dec.exists()) return true
+
+        // Try adb fallback first (fast, for development)
+        val adbDir = File("/data/local/tmp/${variant.filename}")
+        if (File(adbDir, "encoder_model.onnx").exists() && File(adbDir, "decoder_model.onnx").exists()) {
             withContext(Dispatchers.Main) {
-                availableModels.value = found
-                if (found.isNotEmpty()) {
-                    val best = found.first()
-                    selectedModel.value = best
-                    modelStatus.value = "Found: ${found.joinToString(", ") { it.label }}"
-                    modelReady.value = true
-                    val numCb = best.fixedCodebooks ?: selectedCodebooks.intValue
-                    prepareCodecs(best, numCb)
-                } else {
-                    modelStatus.value = "No ONNX models found. Push to /data/local/tmp/ or bundle in assets."
+                modelStatus.value = "Copying ${variant.label} from local..."
+            }
+            try {
+                localDir.mkdirs()
+                for (name in ModelVariant.MODEL_FILES) {
+                    val src = File(adbDir, name)
+                    if (src.exists()) src.copyTo(File(localDir, name), overwrite = true)
+                }
+                return true
+            } catch (_: Exception) { }
+        }
+
+        // Download from HuggingFace
+        localDir.mkdirs()
+        for (name in ModelVariant.MODEL_FILES) {
+            val dest = File(localDir, name)
+            if (dest.exists()) continue
+            val url = "${ModelVariant.HF_BASE_URL}/${variant.hfSubdir}/$name"
+            withContext(Dispatchers.Main) {
+                modelStatus.value = "Downloading ${variant.label}: $name..."
+            }
+            try {
+                downloadFile(url, dest) { progress ->
+                    modelStatus.value = "Downloading ${variant.label}: $name ${progress}%"
+                }
+            } catch (e: Exception) {
+                Log.e("MimiDownload", "Failed to download ${variant.label}: $name", e)
+                localDir.deleteRecursively()
+                withContext(Dispatchers.Main) {
+                    modelStatus.value = "Download failed: ${e.message}"
+                }
+                return false
+            }
+        }
+        return true
+    }
+
+    private suspend fun downloadFile(url: String, dest: File, onProgress: (Int) -> Unit) {
+        withContext(Dispatchers.IO) {
+            val tmp = File(dest.parent, "${dest.name}.tmp")
+            val maxRetries = 3
+            for (attempt in 1..maxRetries) {
+                try {
+                    // Follow redirects manually (HuggingFace uses 307)
+                    var currentUrl = url
+                    var conn: HttpURLConnection
+                    var redirects = 0
+                    while (true) {
+                        conn = URL(currentUrl).openConnection() as HttpURLConnection
+                        conn.connectTimeout = 15_000
+                        conn.readTimeout = 300_000
+                        conn.instanceFollowRedirects = false
+                        conn.setRequestProperty("User-Agent", "MimiDemo/1.0")
+                        // Resume partial download
+                        val existingBytes = if (tmp.exists()) tmp.length() else 0L
+                        if (existingBytes > 0) {
+                            conn.setRequestProperty("Range", "bytes=$existingBytes-")
+                        }
+                        conn.connect()
+                        val code = conn.responseCode
+                        if (code in 301..308) {
+                            val location = conn.getHeaderField("Location") ?: break
+                            currentUrl = if (location.startsWith("http")) location
+                                         else "${URL(currentUrl).protocol}://${URL(currentUrl).host}$location"
+                            conn.disconnect()
+                            if (++redirects > 5) throw RuntimeException("Too many redirects")
+                            continue
+                        }
+                        break
+                    }
+
+                    if (conn.responseCode != 200 && conn.responseCode != 206) {
+                        throw RuntimeException("HTTP ${conn.responseCode}")
+                    }
+
+                    val resumed = conn.responseCode == 206
+                    val existingBytes = if (resumed && tmp.exists()) tmp.length() else 0L
+                    val contentLength = conn.contentLengthLong
+                    val total = if (resumed) existingBytes + contentLength else contentLength
+
+                    var downloaded = existingBytes
+
+                    conn.inputStream.buffered().use { input ->
+                        tmp.outputStream(resumed).buffered().use { output ->
+                            val buf = ByteArray(256 * 1024)
+                            while (true) {
+                                val n = input.read(buf)
+                                if (n < 0) break
+                                output.write(buf, 0, n)
+                                downloaded += n
+                                if (total > 0 && downloaded % (1024 * 1024) < buf.size) {
+                                    withContext(Dispatchers.Main) {
+                                        onProgress((downloaded * 100 / total).toInt())
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    tmp.renameTo(dest)
+                    return@withContext
+                } catch (e: Exception) {
+                    if (attempt == maxRetries) {
+                        tmp.delete()
+                        throw e
+                    }
+                    Log.w("MimiDownload", "Attempt $attempt/$maxRetries failed, retrying: ${e.message}")
+                    kotlinx.coroutines.delay(2000L * attempt)
                 }
             }
         }
     }
 
-
-    private fun copyOnnxFromAssets(assetDir: String, localDir: File): Boolean {
-        return try {
-            val files = assets.list(assetDir) ?: return false
-            if (!files.contains("encoder_model.onnx") || !files.contains("decoder_model.onnx")) return false
-            localDir.mkdirs()
-            for (name in files) {
-                assets.open("$assetDir/$name").use { input ->
-                    File(localDir, name).outputStream().use { output ->
-                        input.copyTo(output)
-                    }
-                }
-            }
-            true
-        } catch (_: Exception) {
-            false
-        }
+    /** Open file for writing — append mode when resuming. */
+    private fun File.outputStream(append: Boolean): java.io.FileOutputStream {
+        return java.io.FileOutputStream(this, append)
     }
 
     private fun createCodec(variant: ModelVariant, numCodebooks: Int): MimiCodec {
