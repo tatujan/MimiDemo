@@ -1,3 +1,5 @@
+@file:OptIn(ExperimentalLayoutApi::class)
+
 package com.example.mimi
 
 import android.Manifest
@@ -14,6 +16,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
@@ -35,14 +39,16 @@ import java.io.File
 
 enum class ModelVariant(val label: String, val filename: String) {
     ONNX_8CB("ONNX-8cb", "onnx_8cb"),
-    ONNX_16CB("ONNX-16cb", "onnx_16cb");
+    ONNX_16CB("ONNX-16cb", "onnx_16cb"),
+    ONNX_8CB_FP16("ONNX-8cb-fp16", "onnx_8cb_fp16"),
+    ONNX_16CB_FP16("ONNX-16cb-fp16", "onnx_16cb_fp16");
 
     val isOnnx: Boolean get() = true
 
     /** ONNX models have a fixed codebook count baked into the model. */
     val fixedCodebooks: Int? get() = when (this) {
-        ONNX_8CB -> 8
-        ONNX_16CB -> 16
+        ONNX_8CB, ONNX_8CB_FP16 -> 8
+        ONNX_16CB, ONNX_16CB_FP16 -> 16
     }
 }
 
@@ -183,7 +189,7 @@ class MainActivity : ComponentActivity() {
 
             // Model selector
             Text("Model:", fontWeight = FontWeight.Medium)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 ModelVariant.entries.forEach { variant ->
                     val isAvailable = variant in available
                     FilterChip(
